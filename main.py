@@ -16,16 +16,16 @@ from deep_translator import GoogleTranslator
 
 RSS_URLS = [
     "https://feeds.bloomberg.com/markets/news.rss",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # 你的频道，例如 @btc8688
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # 默认 5 分钟
-SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))  # 每条消息之间间隔
-MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "500"))  # 摘要最长截取
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))   # 默认 5 分钟
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))           # 每条消息间隔
+MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "500"))
 FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
 
 
@@ -91,16 +91,6 @@ def clean_html(text: str) -> str:
     return text.strip()
 
 
-def safe_translate(text: str) -> str:
-    if not text:
-        return ""
-    try:
-        return GoogleTranslator(source="auto", target="zh-CN").translate(text)
-    except Exception as e:
-        print(f"翻译失败: {e}")
-        return text
-
-
 def shorten_text(text: str, max_len: int) -> str:
     if not text:
         return ""
@@ -110,22 +100,50 @@ def shorten_text(text: str, max_len: int) -> str:
     return text[:max_len].rstrip() + "..."
 
 
+def safe_translate(text: str) -> str:
+    """
+    严格模式：
+    - 翻译成功返回中文
+    - 翻译失败返回空字符串
+    - 绝不返回英文原文
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+    if not text:
+        return ""
+
+    # 避免太长导致翻译服务不稳定
+    if len(text) > 800:
+        text = text[:800]
+
+    for i in range(3):
+        try:
+            result = GoogleTranslator(source="auto", target="zh-CN").translate(text)
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            print(f"翻译失败，第{i + 1}次: {e}")
+            time.sleep(1)
+
+    return ""
+
+
 def get_source_name(entry, feed) -> str:
-    # 优先取 feed 标题
     source = getattr(feed.feed, "title", "").strip()
     if source:
         return source
 
-    # 其次根据链接域名简单判断
     link = getattr(entry, "link", "")
     if "bloomberg.com" in link:
         return "Bloomberg"
-    if "cnbc.com" in link:
-        return "CNBC"
     if "coindesk.com" in link:
         return "CoinDesk"
     if "cointelegraph.com" in link:
         return "Cointelegraph"
+    if "decrypt.co" in link:
+        return "Decrypt"
     return "未知来源"
 
 
@@ -144,14 +162,12 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
         "#黄金": ["gold", "黄金"],
         "#交易所": ["binance", "coinbase", "kraken", "exchange", "交易所"],
         "#链上": ["blockchain", "on-chain", "链上"],
-        "#汽车": ["geely", "tesla", "auto", "car", "汽车", "吉利", "特斯拉"],
     }
 
     for tag, keywords in keyword_map.items():
         if any(k in text for k in keywords):
             tags.append(tag)
 
-    # 限制标签数量，避免太乱
     return tags[:3]
 
 
@@ -178,9 +194,9 @@ def format_message(title_cn: str, summary_cn: str, title_en: str, link: str, sou
 
     msg = "\n".join(parts).strip()
 
-    # Telegram 单条消息长度限制，保守处理
     if len(msg) > 3500:
         msg = msg[:3500].rstrip() + "..."
+
     return msg
 
 
@@ -211,7 +227,7 @@ def process_feed(feed_url: str):
         return
 
     entries = list(feed.entries[:10])
-    entries.reverse()  # 从旧到新发
+    entries.reverse()
 
     first_run = not has_any_sent_items()
 
@@ -219,9 +235,9 @@ def process_feed(feed_url: str):
         link = getattr(entry, "link", "").strip()
         title_en = clean_html(getattr(entry, "title", "").strip())
 
-        # 优先取 summary，没有就取 description
         raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
         summary_clean = clean_html(raw_summary)
+        summary_clean = re.sub(r"\s+", " ", summary_clean).strip()
         summary_clean = shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
 
         if not link or not title_en:
@@ -230,7 +246,7 @@ def process_feed(feed_url: str):
         if has_sent(link):
             continue
 
-        # 第一次启动：只记录旧新闻，不推送，防止刷屏
+        # 首次启动时：只记录旧新闻，不推送，防止刷屏
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link)
@@ -238,6 +254,18 @@ def process_feed(feed_url: str):
 
         title_cn = safe_translate(title_en)
         summary_cn = safe_translate(summary_clean) if summary_clean else ""
+
+        # 严格模式：标题翻译失败，直接跳过
+        if not title_cn:
+            print("跳过：标题翻译失败 ->", title_en)
+            mark_sent(link)
+            continue
+
+        # 如果原文有摘要，但摘要翻译失败，也跳过
+        if summary_clean and not summary_cn:
+            print("跳过：摘要翻译失败 ->", title_en)
+            mark_sent(link)
+            continue
 
         source = get_source_name(entry, feed)
         tags = detect_tags(title_en, title_cn, summary_cn)
@@ -269,7 +297,7 @@ def main():
 
     init_db()
 
-    print("翻译机器人启动成功")
+    print("翻译机器人启动成功（纯中文严格模式）")
     print("频道:", CHAT_ID)
 
     while True:
