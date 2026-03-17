@@ -19,6 +19,7 @@ RSS_URLS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",  # US Top News and Analysis
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -102,10 +103,10 @@ def shorten_text(text: str, max_len: int) -> str:
 
 def safe_translate(text: str) -> str:
     """
-    严格模式：
-    - 翻译成功返回中文
-    - 翻译失败返回空字符串
-    - 绝不返回英文原文
+    半严格模式：
+    - 标题必须翻译成功
+    - 摘要翻译失败可留空
+    - 绝不返回英文原文作为中文内容
     """
     if not text:
         return ""
@@ -114,7 +115,6 @@ def safe_translate(text: str) -> str:
     if not text:
         return ""
 
-    # 避免太长导致翻译服务不稳定
     if len(text) > 800:
         text = text[:800]
 
@@ -144,6 +144,8 @@ def get_source_name(entry, feed) -> str:
         return "Cointelegraph"
     if "decrypt.co" in link:
         return "Decrypt"
+    if "dj.com" in link:
+        return "US Top News and Analysis"
     return "未知来源"
 
 
@@ -246,7 +248,6 @@ def process_feed(feed_url: str):
         if has_sent(link):
             continue
 
-        # 首次启动时：只记录旧新闻，不推送，防止刷屏
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link)
@@ -255,17 +256,16 @@ def process_feed(feed_url: str):
         title_cn = safe_translate(title_en)
         summary_cn = safe_translate(summary_clean) if summary_clean else ""
 
-        # 严格模式：标题翻译失败，直接跳过
+        # 标题翻译失败：整条跳过
         if not title_cn:
             print("跳过：标题翻译失败 ->", title_en)
             mark_sent(link)
             continue
 
-        # 如果原文有摘要，但摘要翻译失败，也跳过
+        # 摘要翻译失败：允许只发标题
         if summary_clean and not summary_cn:
-            print("跳过：摘要翻译失败 ->", title_en)
-            mark_sent(link)
-            continue
+            print("摘要翻译失败，仅发送标题 ->", title_en)
+            summary_cn = ""
 
         source = get_source_name(entry, feed)
         tags = detect_tags(title_en, title_cn, summary_cn)
@@ -297,7 +297,7 @@ def main():
 
     init_db()
 
-    print("翻译机器人启动成功（纯中文严格模式）")
+    print("翻译机器人启动成功（半严格模式）")
     print("频道:", CHAT_ID)
 
     while True:
