@@ -25,8 +25,8 @@ RSS_URLS = [
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # 例如 @你的频道用户名
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))   # 默认 5 分钟
-SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))           # 每条消息之间间隔
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "900"))
 FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
 
@@ -131,25 +131,6 @@ def safe_translate(text: str) -> str:
     return ""
 
 
-def get_source_name(entry, feed) -> str:
-    source = getattr(feed.feed, "title", "").strip()
-    if source:
-        return source
-
-    link = getattr(entry, "link", "")
-    if "bloomberg.com" in link:
-        return "Bloomberg"
-    if "coindesk.com" in link:
-        return "CoinDesk"
-    if "cointelegraph.com" in link:
-        return "Cointelegraph"
-    if "decrypt.co" in link:
-        return "Decrypt"
-    if "dj.com" in link:
-        return "US Top News and Analysis"
-    return "未知来源"
-
-
 def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
     text = f"{title_en}\n{title_cn}\n{summary_cn}".lower()
     tags = []
@@ -218,9 +199,9 @@ def is_valid_http_url(url: str) -> bool:
         return False
 
 
-def build_caption(title_cn: str, summary_cn: str, source: str, tags: list) -> str:
+def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
     """
-    只发中文，不带链接，不带英文原文
+    只发中文，不带链接，不带英文原文，不显示来源
     """
     header = "【财经翻译】"
     tag_line = " ".join(tags).strip()
@@ -236,12 +217,8 @@ def build_caption(title_cn: str, summary_cn: str, source: str, tags: list) -> st
         parts.append("")
         parts.append(summary_cn.strip())
 
-    parts.append("")
-    parts.append(f"来源：{source}")
-
     caption = "\n".join(parts).strip()
 
-    # Telegram photo caption 上限 1024
     if len(caption) > 1000:
         caption = caption[:1000].rstrip() + "..."
     return caption
@@ -286,7 +263,6 @@ def extract_summary(entry) -> str:
         or getattr(entry, "description", "")
     )
 
-    # 一些源会把正文片段放在 content 里
     content_list = getattr(entry, "content", None)
     if content_list and isinstance(content_list, list):
         for item in content_list:
@@ -297,7 +273,6 @@ def extract_summary(entry) -> str:
     summary_clean = clean_html(raw_summary)
     summary_clean = re.sub(r"\s+", " ", summary_clean).strip()
 
-    # 太短就视为没有摘要
     if len(summary_clean) < 40:
         return ""
 
@@ -341,24 +316,20 @@ def process_feed(feed_url: str):
         title_cn = safe_translate(title_en)
         summary_cn = safe_translate(summary_clean) if summary_clean else ""
 
-        # 标题翻译失败：整条跳过
         if not title_cn:
             print("跳过：标题翻译失败 ->", title_en)
             mark_sent(link)
             continue
 
-        # 摘要翻译失败：允许只发标题
         if summary_clean and not summary_cn:
             print("摘要翻译失败，仅发送标题 ->", title_en)
             summary_cn = ""
 
-        # 摘要翻出来太短，也直接清空
         if summary_cn and len(summary_cn.strip()) < 15:
             summary_cn = ""
 
-        source = get_source_name(entry, feed)
         tags = detect_tags(title_en, title_cn, summary_cn)
-        caption = build_caption(title_cn, summary_cn, source, tags)
+        caption = build_caption(title_cn, summary_cn, tags)
 
         image_url = get_image_url(entry)
 
@@ -388,7 +359,7 @@ def main():
 
     init_db()
 
-    print("翻译机器人启动成功（长摘要图文无链接版）")
+    print("翻译机器人启动成功（长摘要图文无链接无来源版）")
     print("频道:", CHAT_ID)
 
     while True:
