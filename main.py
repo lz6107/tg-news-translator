@@ -4,6 +4,7 @@ import time
 import html
 import sqlite3
 from datetime import datetime
+from urllib.parse import urlparse
 
 import feedparser
 import requests
@@ -19,13 +20,13 @@ RSS_URLS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",  # US Top News and Analysis
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # 你的频道，例如 @btc8688
+CHAT_ID = os.getenv("CHAT_ID")  # 例如 @btc8688
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))   # 默认 5 分钟
-SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))           # 每条消息间隔
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))           # 每条消息发送间隔
 MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "500"))
 FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
 
@@ -103,10 +104,10 @@ def shorten_text(text: str, max_len: int) -> str:
 
 def safe_translate(text: str) -> str:
     """
-    半严格模式：
-    - 标题必须翻译成功
-    - 摘要翻译失败可留空
-    - 绝不返回英文原文作为中文内容
+    规则：
+    - 翻译成功返回中文
+    - 翻译失败返回空字符串
+    - 不返回英文原文
     """
     if not text:
         return ""
@@ -115,6 +116,7 @@ def safe_translate(text: str) -> str:
     if not text:
         return ""
 
+    # 限制长度，减少翻译失败概率
     if len(text) > 800:
         text = text[:800]
 
@@ -164,6 +166,7 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
         "#黄金": ["gold", "黄金"],
         "#交易所": ["binance", "coinbase", "kraken", "exchange", "交易所"],
         "#链上": ["blockchain", "on-chain", "链上"],
+        "#AI": ["ai", "artificial intelligence", "人工智能"],
     }
 
     for tag, keywords in keyword_map.items():
@@ -173,7 +176,60 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
     return tags[:3]
 
 
-def format_message(title_cn: str, summary_cn: str, title_en: str, link: str, source: str, tags: list) -> str:
+def get_image_url(entry) -> str:
+    # 1. media_content
+    media_content = getattr(entry, "media_content", None)
+    if media_content and isinstance(media_content, list):
+        for item in media_content:
+            url = item.get("url")
+            if url:
+                return url
+
+    # 2. media_thumbnail
+    media_thumbnail = getattr(entry, "media_thumbnail", None)
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            url = item.get("url")
+            if url:
+                return url
+
+    # 3. enclosure/image
+    links = getattr(entry, "links", [])
+    if links:
+        for item in links:
+            href = item.get("href", "")
+            type_ = item.get("type", "")
+            rel = item.get("rel", "")
+            if href and (rel == "enclosure" or str(type_).startswith("image/")):
+                return href
+
+    # 4. summary 里的 img
+    raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    if raw_summary:
+        m = re.search(r'<img[^>]+src="([^"]+)"', raw_summary, re.I)
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def is_valid_http_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def build_caption(title_cn: str, summary_cn: str, source: str, tags: list) -> str:
+    """
+    最终发到频道的内容：
+    - 只保留中文
+    - 不带链接
+    - 不带英文原文
+    """
     header = "【财经翻译】"
     tag_line = " ".join(tags).strip()
 
@@ -189,17 +245,14 @@ def format_message(title_cn: str, summary_cn: str, title_en: str, link: str, sou
         parts.append(summary_cn.strip())
 
     parts.append("")
-    parts.append(f"原文：{title_en.strip()}")
     parts.append(f"来源：{source}")
-    parts.append("")
-    parts.append(link.strip())
 
-    msg = "\n".join(parts).strip()
+    caption = "\n".join(parts).strip()
 
-    if len(msg) > 3500:
-        msg = msg[:3500].rstrip() + "..."
-
-    return msg
+    # Telegram 图片 caption 上限 1024
+    if len(caption) > 1000:
+        caption = caption[:1000].rstrip() + "..."
+    return caption
 
 
 def send_telegram_message(text: str):
@@ -209,11 +262,27 @@ def send_telegram_message(text: str):
         data={
             "chat_id": CHAT_ID,
             "text": text,
-            "disable_web_page_preview": False
+            "disable_web_page_preview": True
         },
         timeout=30
     )
-    print("发送结果:", resp.status_code, resp.text)
+    print("sendMessage 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def send_telegram_photo(photo_url: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "photo": photo_url,
+            "caption": caption
+        },
+        timeout=30
+    )
+    print("sendPhoto 结果:", resp.status_code, resp.text)
+    return resp
 
 
 # =========================
@@ -248,6 +317,7 @@ def process_feed(feed_url: str):
         if has_sent(link):
             continue
 
+        # 首次运行：只记录旧新闻，不推送
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link)
@@ -269,20 +339,23 @@ def process_feed(feed_url: str):
 
         source = get_source_name(entry, feed)
         tags = detect_tags(title_en, title_cn, summary_cn)
+        caption = build_caption(title_cn, summary_cn, source, tags)
 
-        msg = format_message(
-            title_cn=title_cn,
-            summary_cn=summary_cn,
-            title_en=title_en,
-            link=link,
-            source=source,
-            tags=tags
-        )
+        image_url = get_image_url(entry)
 
         try:
-            send_telegram_message(msg)
+            # 优先发图文
+            if is_valid_http_url(image_url):
+                resp = send_telegram_photo(image_url, caption)
+                if resp.status_code != 200:
+                    print("图片发送失败，改为纯文字")
+                    send_telegram_message(caption)
+            else:
+                send_telegram_message(caption)
+
             mark_sent(link)
             print("已发送:", title_en)
+
         except Exception as e:
             print("发送失败:", e)
 
@@ -297,7 +370,7 @@ def main():
 
     init_db()
 
-    print("翻译机器人启动成功（半严格模式）")
+    print("翻译机器人启动成功（图文无链接模式）")
     print("频道:", CHAT_ID)
 
     while True:
