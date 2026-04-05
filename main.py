@@ -4,7 +4,7 @@ import time
 import html
 import sqlite3
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
@@ -12,7 +12,7 @@ from deep_translator import GoogleTranslator
 
 
 # =========================
-# 基础配置
+# 财经 / 币圈 RSS 源
 # =========================
 
 RSS_URLS = [
@@ -21,14 +21,22 @@ RSS_URLS = [
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
     "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://feeds.reuters.com/Reuters/worldNews",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # 例如 @你的频道用户名
+CHAT_ID = os.getenv("CHAT_ID")
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "900"))
-FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
+
+FIRST_RUN_SKIP_OLD = True
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+}
 
 
 # =========================
@@ -103,12 +111,6 @@ def shorten_text(text: str, max_len: int) -> str:
 
 
 def safe_translate(text: str) -> str:
-    """
-    规则：
-    - 翻译成功返回中文
-    - 翻译失败返回空字符串
-    - 不返回英文原文
-    """
     if not text:
         return ""
 
@@ -156,7 +158,7 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
     return tags[:3]
 
 
-def get_image_url(entry) -> str:
+def get_image_url_from_rss(entry) -> str:
     media_content = getattr(entry, "media_content", None)
     if media_content and isinstance(media_content, list):
         for item in media_content:
@@ -189,6 +191,16 @@ def get_image_url(entry) -> str:
     return ""
 
 
+def normalize_image_url(img_url: str, base_url: str) -> str:
+    if not img_url:
+        return ""
+    if img_url.startswith("//"):
+        return "https:" + img_url
+    if img_url.startswith("/"):
+        return urljoin(base_url, img_url)
+    return img_url
+
+
 def is_valid_http_url(url: str) -> bool:
     if not url:
         return False
@@ -199,9 +211,71 @@ def is_valid_http_url(url: str) -> bool:
         return False
 
 
+def get_image_url_from_page(article_url: str) -> str:
+    """
+    RSS 没图时，进原文页面抓图。
+    优先：
+    1. og:image
+    2. twitter:image
+    3. 页面里第一张较大的图片
+    """
+    if not is_valid_http_url(article_url):
+        return ""
+
+    try:
+        resp = requests.get(article_url, headers=REQUEST_HEADERS, timeout=15)
+        if resp.status_code != 200 or not resp.text:
+            return ""
+
+        html_text = resp.text
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, html_text, re.I)
+            if m:
+                img = normalize_image_url(m.group(1).strip(), article_url)
+                if is_valid_http_url(img):
+                    return img
+
+        imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.I)
+        for img in imgs:
+            img = normalize_image_url(img.strip(), article_url)
+            if not is_valid_http_url(img):
+                continue
+
+            lower_img = img.lower()
+            if any(x in lower_img for x in ["logo", "icon", "avatar", "sprite", ".svg"]):
+                continue
+
+            return img
+
+    except Exception as e:
+        print(f"网页抓图失败: {article_url} -> {e}")
+
+    return ""
+
+
+def get_best_image_url(entry, article_url: str) -> str:
+    rss_img = get_image_url_from_rss(entry)
+    if is_valid_http_url(rss_img):
+        return rss_img
+
+    page_img = get_image_url_from_page(article_url)
+    if is_valid_http_url(page_img):
+        return page_img
+
+    return ""
+
+
 def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
     """
-    只发中文，不带链接，不带英文原文，不显示来源
+    只发中文，不带链接，不带来源，不带英文原文
     """
     header = "【财经翻译】"
     tag_line = " ".join(tags).strip()
@@ -255,9 +329,6 @@ def send_telegram_photo(photo_url: str, caption: str):
 
 
 def extract_summary(entry) -> str:
-    """
-    尽量提取更长的正文摘要
-    """
     raw_summary = (
         getattr(entry, "summary", "")
         or getattr(entry, "description", "")
@@ -280,7 +351,7 @@ def extract_summary(entry) -> str:
 
 
 # =========================
-# 核心处理
+# 核心逻辑
 # =========================
 
 def process_feed(feed_url: str):
@@ -331,7 +402,7 @@ def process_feed(feed_url: str):
         tags = detect_tags(title_en, title_cn, summary_cn)
         caption = build_caption(title_cn, summary_cn, tags)
 
-        image_url = get_image_url(entry)
+        image_url = get_best_image_url(entry, link)
 
         try:
             if is_valid_http_url(image_url):
@@ -359,7 +430,7 @@ def main():
 
     init_db()
 
-    print("翻译机器人启动成功（长摘要图文无链接无来源版）")
+    print("财经机器人启动成功（抓原文图增强版）")
     print("频道:", CHAT_ID)
 
     while True:
