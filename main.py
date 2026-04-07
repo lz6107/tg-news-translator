@@ -3,6 +3,7 @@ import re
 import time
 import html
 import sqlite3
+import random
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
@@ -37,6 +38,9 @@ FIRST_RUN_SKIP_OLD = True
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 }
+
+# 本地默认封面图目录
+COVERS_DIR = "covers"
 
 
 # =========================
@@ -261,23 +265,51 @@ def get_image_url_from_page(article_url: str) -> str:
     return ""
 
 
-def get_best_image_url(entry, article_url: str) -> str:
+def get_local_cover_list():
+    if not os.path.isdir(COVERS_DIR):
+        return []
+
+    files = []
+    for name in os.listdir(COVERS_DIR):
+        lower = name.lower()
+        if lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png"):
+            files.append(os.path.join(COVERS_DIR, name))
+
+    return sorted(files)
+
+
+def get_random_local_cover():
+    covers = get_local_cover_list()
+    if not covers:
+        return ""
+    return random.choice(covers)
+
+
+def get_best_image(entry, article_url: str):
+    """
+    返回：
+    ("url", 图片URL) 或 ("file", 本地图片路径) 或 ("", "")
+    """
     rss_img = get_image_url_from_rss(entry)
     if is_valid_http_url(rss_img):
-        return rss_img
+        return ("url", rss_img)
 
     page_img = get_image_url_from_page(article_url)
     if is_valid_http_url(page_img):
-        return page_img
+        return ("url", page_img)
 
-    return ""
+    local_cover = get_random_local_cover()
+    if local_cover and os.path.isfile(local_cover):
+        return ("file", local_cover)
+
+    return ("", "")
 
 
 def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
     """
     只发中文，不带链接，不带来源，不带英文原文
     """
-    header = "【财经翻译】"
+    header = "【暴涨财经】"
     tag_line = " ".join(tags).strip()
 
     parts = [header]
@@ -313,7 +345,7 @@ def send_telegram_message(text: str):
     return resp
 
 
-def send_telegram_photo(photo_url: str, caption: str):
+def send_telegram_photo_by_url(photo_url: str, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     resp = requests.post(
         url,
@@ -324,7 +356,25 @@ def send_telegram_photo(photo_url: str, caption: str):
         },
         timeout=30
     )
-    print("sendPhoto 结果:", resp.status_code, resp.text)
+    print("sendPhoto(url) 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def send_telegram_photo_by_file(photo_path: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption
+            },
+            files={
+                "photo": f
+            },
+            timeout=30
+        )
+    print("sendPhoto(file) 结果:", resp.status_code, resp.text)
     return resp
 
 
@@ -402,14 +452,21 @@ def process_feed(feed_url: str):
         tags = detect_tags(title_en, title_cn, summary_cn)
         caption = build_caption(title_cn, summary_cn, tags)
 
-        image_url = get_best_image_url(entry, link)
+        img_type, img_value = get_best_image(entry, link)
 
         try:
-            if is_valid_http_url(image_url):
-                resp = send_telegram_photo(image_url, caption)
+            if img_type == "url":
+                resp = send_telegram_photo_by_url(img_value, caption)
                 if resp.status_code != 200:
-                    print("图片发送失败，改为纯文字")
+                    print("远程图片发送失败，改为纯文字")
                     send_telegram_message(caption)
+
+            elif img_type == "file":
+                resp = send_telegram_photo_by_file(img_value, caption)
+                if resp.status_code != 200:
+                    print("本地默认图发送失败，改为纯文字")
+                    send_telegram_message(caption)
+
             else:
                 send_telegram_message(caption)
 
@@ -430,7 +487,7 @@ def main():
 
     init_db()
 
-    print("财经机器人启动成功（抓原文图增强版）")
+    print("财经机器人启动成功（默认图版）")
     print("频道:", CHAT_ID)
 
     while True:
